@@ -1,40 +1,134 @@
-#!/usr/bin/env perl
-@lines = qx/scontrol -o show node/;
-printf ("%-18s %6s %6s %6s %8s %6s %6s %6s %6s   %-15s\n","Hostname","Cores","InUse","Ratio","Load","GPUs","InUse","Mem","Alloc","State");
-foreach (@lines){
-    chomp;
-    ($reason) = $_ =~ /Reason=(.*)/;
-    ($state) = $_ =~ /State=([^\s]+)/;
-    ($real) = $_ =~ /RealMemory=([^\s]+)/;
-    ($alloc) = $_ =~ /AllocMem=([^\s]+)/;
-    ($cfgtres) = $_ =~ /CfgTRES=([^\s]+)/;
-    ($alloctres) = $_ =~ /AllocTRES=([^\s]+)/;
-    %data = map {/([^= ]+)/ => /=\s*(.*)/} split /\s+/;
-    $data{'Reason'} = $reason;
-    $data{'State'} = $state;
-    $data{'RealMemory'} = $real;
-    $data{'AllocMem'} = $alloc;
+#!/usr/bin/env python3
+import subprocess
+import re
+import argparse
+import csv
+import json
 
-    %ctres = map{split /\=/, $_}(split /,/, $cfgtres);
-    %atres = map{split /\=/, $_}(split /,/, $alloctres);
+def parse_keyvals(fields):
+    return {key: val for keyval in fields if '=' in keyval for key, val in [keyval.split('=', 1)]}
 
-    if ($ctres{'gres/gpu'}){
-      $cgpu = $ctres{'gres/gpu'};
-      $agpu = $atres{'gres/gpu'};
-    }
-    else {
-      $cgpu = 0;
-      $agpu = 0;
-    }
+def parse_tres(tres_str):
+    return dict(item.split('=') for item in tres_str.split(',') if '=' in item)
 
-    if ($data{'Arch'}){
-      printf ("%-18s %6d %6d",$data{'NodeName'},$data{'CPUTot'},$data{'CPUAlloc'});
-      if ($data{'CPUAlloc'} > 0){ printf (" %6.1f ",( $data{'CPUAlloc'} / $data{'CPUTot'} ) * 100); }
-      else { printf (" %6.1f ", "0.0"); }
-      printf ("%8.2f %6d %6d %6d %6d   %-15s ",$data{'CPULoad'},int($cgpu),int($agpu),int($data{'RealMemory'} / 1024),int( $data{'AllocMem'} / 1024 ),$data{'State'});
-      if ($data{'Reason'}) {print $data{'Reason'};}
-      print "\n";
-    }
-    else {printf ("%-18s %6s %6s %6s %8s %6s %6s %6s %6s   %-15s %s\n",$data{'NodeName'}."(d)",0,0,0.0,0.00,0,0,0,0,"DOWN",$data{'Reason'});}
-}
+def get_nodes():
+    return subprocess.getoutput("scontrol -o show node").splitlines()
 
+# def extract_node_info(line):
+#     data = parse_keyvals(line.strip().split())
+#     data['Reason'] = re.search(r'Reason=(.*)', line).group(1) if 'Reason=' in line else ''
+#     data['State'] = re.search(r'State=([^\s]+)', line).group(1) if 'State=' in line else ''
+#     data['RealMemory'] = int(re.search(r'RealMemory=([^\s]+)', line).group(1)) if 'RealMemory=' in line else 0
+#     data['AllocMem'] = int(re.search(r'AllocMem=([^\s]+)', line).group(1)) if 'AllocMem=' in line else 0
+# 
+#     ctres = parse_tres(re.search(r'CfgTRES=([^\s]+)', line).group(1)) if 'CfgTRES=' in line else {}
+#     atres = parse_tres(re.search(r'AllocTRES=([^\s]+)', line).group(1)) if 'AllocTRES=' in line else {}
+# 
+#     data['CfgGPU'] = int(ctres.get('gres/gpu', 0))
+#     data['AllocGPU'] = int(atres.get('gres/gpu', 0))
+#     return data
+ 
+def extract_node_info(line):
+    data = parse_keyvals(line.strip().split())
+    data['Reason'] = re.search(r'Reason=(.*)', line).group(1) if 'Reason=' in line else ''
+    data['State'] = re.search(r'State=([^\s]+)', line).group(1) if 'State=' in line else ''
+    data['RealMemory'] = int(re.search(r'RealMemory=([^\s]+)', line).group(1)) if 'RealMemory=' in line else 0
+    data['AllocMem'] = int(re.search(r'AllocMem=([^\s]+)', line).group(1)) if 'AllocMem=' in line else 0
+
+    cfg_tres_match = re.search(r'CfgTRES=([^\s]+)', line)
+    alloc_tres_match = re.search(r'AllocTRES=([^\s]+)', line)
+    ctres = parse_tres(cfg_tres_match.group(1)) if cfg_tres_match else {}
+    atres = parse_tres(alloc_tres_match.group(1)) if alloc_tres_match else {}
+
+    data['CfgGPU'] = int(ctres.get('gres/gpu', 0))
+    data['AllocGPU'] = int(atres.get('gres/gpu', 0))
+    return data
+
+def should_include(data, args):
+    cpu_alloc = int(data.get('CPUAlloc', 0))
+    gpu_alloc = data.get('AllocGPU', 0)
+
+    if args.cpu and cpu_alloc == 0:
+        return False
+    if args.gpu and gpu_alloc == 0:
+        return False
+    if args.idle and (cpu_alloc > 0 or gpu_alloc > 0):
+        return False
+    if args.state:
+        if not re.search(args.state, data['State'], re.IGNORECASE):
+            return False
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(description="Filter Slurm nodes and optionally export to CSV/JSON.")
+    parser.add_argument('--cpu', action='store_true', help="Show only nodes using CPUs")
+    parser.add_argument('--gpu', action='store_true', help="Show only nodes using GPUs")
+    parser.add_argument('--idle', action='store_true', help="Show only idle nodes (no CPU/GPU use)")
+    parser.add_argument('--state', metavar='REGEX', help="Regex or substring to match node state (e.g., 'idle', 'ALLOC')")
+    parser.add_argument('--csv', metavar='CSV_FILE', help="Write output to CSV")
+    parser.add_argument('--json', metavar='JSON_FILE', help="Write output to JSON")
+    args = parser.parse_args()
+
+    nodes = get_nodes()
+    header = ["Hostname", "Cores", "InUse", "Ratio", "Load", "GPUs", "InUse", "Mem", "Alloc", "State", "Reason"]
+    rows = []
+    json_data = []
+
+    print(f"{header[0]:<18} {header[1]:>6} {header[2]:>6} {header[3]:>6} {header[4]:>8} {header[5]:>6} {header[6]:>6} {header[7]:>6} {header[8]:>6}   {header[9]:<15}")
+
+    for line in nodes:
+        data = extract_node_info(line)
+
+        cputot = int(data.get('CPUTot', 0))
+        cpualloc = int(data.get('CPUAlloc', 0))
+        cpuload = float(data.get('CPULoad', 0.0))
+        ratio = (cpualloc / cputot * 100) if cputot else 0.0
+        mem_gb = data['RealMemory'] // 1024
+        alloc_mem_gb = data['AllocMem'] // 1024
+        hostname = data.get('NodeName', '')
+
+        if not should_include(data, args):
+            continue
+
+        if 'Arch' in data:
+            print(f"{hostname:<18} {cputot:6d} {cpualloc:6d} {ratio:6.1f} "
+                  f"{cpuload:8.2f} {data['CfgGPU']:6d} {data['AllocGPU']:6d} {mem_gb:6d} {alloc_mem_gb:6d}   "
+                  f"{data['State']:<15} {data['Reason']}")
+        else:
+            hostname += '(d)'
+            data['State'] = 'DOWN'
+            cputot = cpualloc = data['CfgGPU'] = data['AllocGPU'] = mem_gb = alloc_mem_gb = 0
+            ratio = 0.0
+            cpuload = 0.0
+            print(f"{hostname:<18} {0:6d} {0:6d} {0.0:6.1f} {0.00:8.2f} {0:6d} {0:6d} {0:6d} {0:6d}   {'DOWN':<15} {data['Reason']}")
+
+        row = [hostname, cputot, cpualloc, round(ratio, 1), round(cpuload, 2),
+               data['CfgGPU'], data['AllocGPU'], mem_gb, alloc_mem_gb, data['State'], data['Reason']]
+        rows.append(row)
+
+        json_data.append({
+            "Hostname": hostname,
+            "Cores": cputot,
+            "InUse": cpualloc,
+            "Ratio": round(ratio, 1),
+            "Load": round(cpuload, 2),
+            "GPUs": data['CfgGPU'],
+            "GPUInUse": data['AllocGPU'],
+            "MemGB": mem_gb,
+            "AllocMemGB": alloc_mem_gb,
+            "State": data['State'],
+            "Reason": data['Reason']
+        })
+
+    if args.csv:
+        with open(args.csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+    if args.json:
+        with open(args.json, 'w') as f:
+            json.dump(json_data, f, indent=2)
+
+if __name__ == '__main__':
+    main()
